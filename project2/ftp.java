@@ -326,10 +326,6 @@ public class ftp {
     
     // Flushes remaining data
     dataOutput.flush();
-
-    // displays a success/error message
-    controlInputStr = controlInput.readLine();
-    System.out.println(controlInputStr);
   }
 
   /**
