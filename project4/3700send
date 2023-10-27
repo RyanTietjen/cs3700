@@ -1,0 +1,177 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, hashlib
+
+DATA_SIZE = 1375
+
+
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+        self.cwnd = 1  # Congestion window
+        self.ssthresh = 4  # Slow start threshold
+        self.packet_log = []  # Log of packets that have been successfully sent
+        self.used_seq = []  # List of sequence numbers that have been used already
+        self.received_acks = []  # List of acks recieved from the receiver
+        self.worklist = []  # List of packets that need to be set
+        self.seq_to_checksum = {}  # The correct checksums for their given sequences
+        self.unconfirmed_packets = []  # List of packets that should be sent, but may be been dropped
+        self.RTT = 1.0  # Round trip time
+        self.timeout = 2 * self.RTT  # timeout time
+        self.seq = 0  # Sequence number for packets
+        self.num_packets = 0  # Number of packets that can be sent
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+
+    def run(self):
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+
+            socks = select.select(sockets, [], [], 0.1)[0]
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    self.num_packets -= 1
+
+                    try:
+                        ack_msg = json.loads(msg)
+                        self.handle_ack(ack_msg)
+                        self.waiting = False
+                        self.adjust_RTT(ack_msg)
+                    except:
+                        self.log("Sender caught error")
+
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE)
+                    self.terminate_if_appropriate(data)
+
+                    # Ensures that we don't infinitely send data if we still need to receive acks
+                    if len(data) != 0:
+                        msg = self.construct_msg(data)
+                        self.worklist.append(msg)
+                    self.determine_if_we_should_be_waiting()
+
+            self.retransmit_dropped_packets()
+            self.send_packets_in_worklist()
+        return
+
+    # Determines if the program is completed
+    def terminate_if_appropriate(self, data):
+        # Ensures that we wait for all acks before terminating
+        if len(data) == 0 and len(self.received_acks) == len(self.packet_log) + len(self.unconfirmed_packets):
+            self.log("All done!")
+            sys.exit(0)
+
+    # Adjusts the round trip time based on the ack received
+    def adjust_RTT(self, ack_msg):
+        sample_RTT = time.time() - ack_msg["time"]
+        self.RTT = ((1 - .125) * self.RTT) + .125 * sample_RTT
+        self.timeout = self.RTT * 2
+
+    # Both AI and MD (AIMD) are from the Transport presentation
+    # Additive increase
+    def AI(self):
+        if self.cwnd < self.ssthresh:
+            self.cwnd += 1
+        else:
+            self.cwnd = self.cwnd + (1 / self.cwnd)
+
+    # Multiplicative decrease
+    def MD(self):
+        self.ssthresh = self.cwnd / 2
+        self.cwnd = 1
+
+    # Sends all the packets in the worklist to the receiver
+    def send_packets_in_worklist(self):
+        sorted_worklist = sorted(self.worklist, key=lambda x: x["seq"])
+        while len(sorted_worklist) != 0:
+            new_msg = sorted_worklist[0]
+            if new_msg["seq"] not in self.used_seq:
+                self.seq += 1
+            self.send_and_log_message(new_msg)
+            sorted_worklist.remove(new_msg)
+        self.worklist = []
+
+    # Sends and logs a packet
+    def send_and_log_message(self, msg):
+        self.log("Sending message '%s'" % msg)
+        self.send(msg)
+        self.used_seq.append(msg["seq"])
+        self.seq_to_checksum[msg["seq"]] = self.calculate_checksum(msg["data"])
+        self.unconfirmed_packets.append(msg)
+        self.num_packets += 1
+
+    # Handles an incoming ack
+    def handle_ack(self, ack_msg):
+        # Make sure that the data isn't corrupted
+        try:
+            if ack_msg["checksum"] == self.seq_to_checksum.get(ack_msg["seq"]):
+                self.remove_by_seq(ack_msg["seq"], self.unconfirmed_packets)
+                if ack_msg["seq"] in self.received_acks:
+                    self.log("Received duplicate acknowledgment for seq %d" % ack_msg["seq"])
+                else:
+                    self.log("Received acknowledgment for seq %d" % ack_msg["seq"])
+                    self.received_acks.append(ack_msg["seq"])
+                    self.packet_log.append(ack_msg["seq"])
+                    self.remove_by_seq(ack_msg["seq"], self.unconfirmed_packets)
+                    self.AI()
+            else:
+                self.log("Sender Detected corruption in packet %d" % ack_msg["seq"])
+        except:
+            self.log("Sender caught error")
+
+    # Removes an item from a list given its sequence number
+    def remove_by_seq(self, seq, list):
+        for packet in list:
+            if packet["seq"] == seq:
+                list.remove(packet)
+
+    # Retransmits dropped packets
+    def retransmit_dropped_packets(self):
+        for packet in self.unconfirmed_packets:
+            if time.time() - packet["time"] > self.timeout:
+                self.log("Resending packet '%d'" % packet["seq"])
+                self.remove_by_seq(packet["seq"], self.unconfirmed_packets)
+                packet["time"] = time.time()
+                self.worklist.append(packet)
+                self.MD()
+
+    # Determines if we should be waiting
+    def determine_if_we_should_be_waiting(self):
+        if self.cwnd < self.num_packets:
+            self.waiting = True
+
+    # Constructs a message to be sent to the receiver
+    def construct_msg(self, data):
+        msg = {"type": "msg",
+               "seq": self.seq,
+               "time": time.time(),
+               "data": data,
+               "checksum": self.calculate_checksum(data)}
+        return msg
+
+    # Calculates a checksum based on given data
+    def calculate_checksum(self, data):
+        # Calculate a simple checksum (e.g., using hashlib)
+        checksum = hashlib.md5(data.encode('utf-8')).hexdigest()
+        return checksum
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
