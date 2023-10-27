@@ -1,0 +1,99 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import hashlib
+
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+        self.received_seqs = []  # Maintain received sequence numbers
+        self.highest_seq = 0  # Highest sequence number the receiver has printed out
+        self.worklist = []  # Represents the messages the receiver has to process
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't already have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+
+                try:
+                    # Parse message to json
+                    msg = json.loads(data.decode('utf-8'))
+                    seq = msg["seq"]
+
+                    # Make sure that the data isn't corrupted
+                    if msg["checksum"] == self.calculate_checksum(msg["data"]):
+                        # Always send back an ack
+                        ack = self.construct_ack(msg)
+                        self.log("Sending ack with seq %d" % seq)
+                        self.send(ack)
+
+                        # Handle message
+                        self.handle_message(msg, seq)
+                    else:
+                        self.log("Receiver Detected corruption in packet %d" % msg["seq"])
+                except:
+                    self.log("Caught error")
+                    continue
+        return
+
+    # Constructs an ack message
+    def construct_ack(self, msg):
+        msg = {"type": "ack",
+               "time": msg["time"],
+               "seq": msg["seq"],
+               "checksum": self.calculate_checksum(msg["data"])}
+        return msg
+
+    # Calculates checksum for given data
+    def calculate_checksum(self, data):
+        # Calculate a simple checksum (e.g., using hashlib)
+        checksum = hashlib.md5(data.encode('utf-8')).hexdigest()
+        return checksum
+
+    # Process a message received by the sender
+    def handle_message(self, msg, seq):
+        if seq in self.received_seqs:
+            # Duplicate packet, ignore it
+            self.log("Received duplicate packet with seq %d" % seq)
+        else:
+            if msg["seq"] >= self.highest_seq:
+                self.worklist.append(msg)
+            self.send_all_possible_messages_in_worklist()
+
+    # Sends all possible messages such that they are in the correct order
+    def send_all_possible_messages_in_worklist(self):
+        sorted_worklist = sorted(self.worklist, key=lambda x: x["seq"])
+        for msg in sorted_worklist:
+            if msg["seq"] == self.highest_seq:
+                self.highest_seq += 1
+                self.log("Received data message %s" % msg)
+                print(msg["data"], end='', flush=True)
+                self.received_seqs.append(msg["seq"])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()
