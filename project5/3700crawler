@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+
+import argparse
+import errno
+import socket
+import ssl
+from html.parser import HTMLParser
+
+import select
+
+DEFAULT_SERVER = "www.3700.network"
+DEFAULT_PORT = 443
+
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+
+        self.csrftoken = None  # csrftoken (found in cookies)
+        self.csrfmiddlewaretoken = None  # csrfmiddlewaretoken (found in html)
+        self.sessionID = None  # sessionid (found in cookies)
+        self.currentResponse = []  # The response to the most recent request
+        self.already_visited = []  # list of webpages already visited
+        self.parser = MyHTMLParser()  # To assist with parsing the html
+
+    def run(self):
+        self.mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.connect_socket()
+
+        self.login()
+
+        # Until 5 flags are found or until there are no more webpages,
+        # recursively crawl each webpage.
+        counter = 0
+        while len(self.parser.worklist) != len(self.already_visited) and len(self.parser.flags) < 5:
+            if (self.parser.worklist[counter] not in self.already_visited) \
+                    and "/fakebook/" in self.parser.worklist[counter]:  # ensures we don't leave fakebook
+                self.force_connection()
+                self.send_get(self.parser.worklist[counter])
+                self.already_visited.append(self.parser.worklist[counter])
+                self.handle_response(self.parser.worklist[counter])
+            counter += 1
+
+        self.mysocket.close()
+
+    # Logs into fakebook
+    def login(self):
+        # Get the cookies from the homepage
+        self.send_get("/accounts/login/")
+        self.handle_response("/accounts/login/")
+
+        # Log in
+        self.send_post("/accounts/login/")
+        self.handle_response("/accounts/login/")
+
+    # Ensures that the socket is still connected
+    def force_connection(self):
+        if self.mysocket._closed:
+            self.mysocket.connect((self.server, self.port))
+            self.login()
+
+    # connects the socket to the server
+    def connect_socket(self):
+        self.mysocket.connect((self.server, self.port))
+        context = ssl.create_default_context()
+        self.mysocket = context.wrap_socket(self.mysocket, server_hostname=self.server)
+
+    # Sends a GET request to the server
+    def send_get(self, path):
+        header = f"GET {path} HTTP/1.1\r\n"
+        host = f"Host: {self.server} \r\n"
+        connection = f"Connection: keep-alive\r\n"
+        cookie = f"Cookie: csrftoken={self.csrftoken}; sessionid={self.sessionID}"
+        request = f"{header}{host}{connection}{cookie}\r\n\r\n"
+        self.mysocket.send(request.encode('utf-8'))
+
+    # Sends a POST request to the server
+    def send_post(self, path):
+        header = f"POST {path} HTTP/1.1\r\n"
+        host = f"Host: {self.server}\r\n"
+        content_type = "Content-Type: application/x-www-form-urlencoded\r\n"
+        cookie = f"Cookie: csrftoken={self.csrftoken}; sessionid={self.sessionID}\r\n\r\n"
+        connection = f"Connection: keep-alive\r\n"
+        data = f'username={self.username}&password={self.password}&csrfmiddlewaretoken={self.parser.csrf}'
+        content_length = f"Content-Length: {len(data)}\r\n"
+        request = f"{header}{host}{content_type}{content_length}{connection}{cookie}{data}"
+        self.mysocket.send(request.encode("utf-8"))
+
+    # Handles responses
+    def handle_response(self, path):
+        # Fully receives all data
+        response = self.mysocket.recv(1000).decode("utf-8") # decoding as ascii resulted in exception thrown
+        while "</html>" not in response:
+            if "302 Found" in response:
+                break
+            response += self.mysocket.recv(1000).decode("utf-8")
+        self.currentResponse = response.split("\r\n")
+
+        # Handles specific responses
+        if "200 OK" in self.currentResponse[0]:
+            self.update_cookies()
+        elif "302 Found" in self.currentResponse[0]:
+            self.update_cookies()
+            self.send_get(self.get_location())
+            self.handle_response(self.get_location())
+        elif "503 Service" in self.currentResponse[0]:
+            self.parser.worklist.append(path)
+            self.already_visited.remove(path)
+
+    # Updates cookies based on most recent webpage
+    def update_cookies(self):
+        self.csrftoken = self.get_csrftoken()
+        self.sessionID = self.get_sessionID()
+        self.parser.feed(self.currentResponse[-1])
+
+    # Obtains the csrftoken from the response
+    def get_csrftoken(self):
+        for str in self.currentResponse:
+            if "csrftoken" in str:
+                semicolon_position = str.find(';')
+                return str[22:semicolon_position]
+        return self.csrftoken
+
+    # Obtains the sessionid from the response
+    def get_sessionID(self):
+        for str in self.currentResponse:
+            if "sessionid" in str:
+                semicolon_position = str.find(';')
+                return str[22:semicolon_position]
+        return self.sessionID
+
+    # Obtains the location from the response
+    def get_location(self):
+        for str in self.currentResponse:
+            if "location" in str:
+                return str[10:]
+        return None
+
+
+# Documentation: https://docs.python.org/3/library/html.parser.html
+class MyHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.csrf = None  # crsftoken
+        self.worklist = []  # list of web pages to crawl
+        self.flags = []  # flags found
+        self.flag_in_this_html = False  # Is there a flag in this html?
+
+    # Is called whenever a start tag is found
+    def handle_starttag(self, tag, attrs):
+        # Find csrfmiddlewaretoken
+        if tag == "input" and ("name", "csrfmiddlewaretoken") in attrs:
+            self.csrf = attrs[2][1]
+
+        # Find all links on this page
+        elif tag == "a" and "/fakebook/" in attrs[0][1]:
+            self.worklist.append(attrs[0][1])
+
+        # Find a flag
+        elif tag == "h3" and ("class", "secret_flag") in attrs:
+            self.flag_in_this_html = True
+
+    # Is called whenever an end tag is found
+    def handle_endtag(self, tag):
+        pass
+
+    # Handles all data in the current html
+    def handle_data(self, data):
+        if self.flag_in_this_html:
+            print(data[6:])  # Prints the flag
+            self.flags.append(data[6:])
+        self.flag_in_this_html = False
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
